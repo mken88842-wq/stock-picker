@@ -199,7 +199,7 @@ def main():
     
     # 下载最近90天数据（每批50只）
     tickers = stock_list['代码'].tolist()
-    SCAN_COUNT = min(len(tickers), 500)  # 扫描500只（可调整）
+    SCAN_COUNT = min(len(tickers), 1000)  # 扫描1000只（池子越大Top3质量越好）
     
     end = datetime.now()
     start = end - timedelta(days=90)
