@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+"""
+反量化博弈策略 — 每日自动扫描
+核心信号：MA20即将突破 + MACD即将金叉
+质量打分 + 每日Top3精选
+"""
 import pandas as pd
 import json
 import os
@@ -6,6 +11,7 @@ import urllib.request
 import urllib.parse
 from datetime import datetime, timedelta
 from pathlib import Path
+import numpy as np
 
 WECHAT_KEY = os.environ.get("SERVER_CHAN_KEY", "")
 OUTPUT_DIR = Path(__file__).parent / "public"
@@ -34,111 +40,272 @@ def send_wechat(title, content):
         log(f"微信异常: {e}")
         return False
 
+def calc_indicators(df):
+    """计算技术指标"""
+    df['MA5'] = df['close'].rolling(5).mean()
+    df['MA10'] = df['close'].rolling(10).mean()
+    df['MA20'] = df['close'].rolling(20).mean()
+    df['MA60'] = df['close'].rolling(60).mean()
+    
+    ema_fast = df['close'].ewm(span=12).mean()
+    ema_slow = df['close'].ewm(span=26).mean()
+    df['DIF'] = ema_fast - ema_slow
+    df['DEA'] = df['DIF'].ewm(span=9).mean()
+    df['MACD'] = 2 * (df['DIF'] - df['DEA'])
+    
+    high_low = df['high'] - df['low']
+    high_close = np.abs(df['high'] - df['close'].shift(1))
+    low_close = np.abs(df['low'] - df['close'].shift(1))
+    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    df['ATR'] = tr.rolling(14).mean()
+    
+    df['VOL_MA20'] = df['volume'].rolling(20).mean()
+    return df
+
+def score_signal(df, i):
+    """信号质量打分（满分10分）"""
+    cur = df.iloc[i]
+    score = 0
+    reasons = []
+    
+    # 1. DIF位置 (0-3分)
+    dif_gap = cur['DIF'] - cur['DEA']
+    if 0 <= dif_gap <= 0.05:
+        score += 3; reasons.append(f"DIF刚金叉+3")
+    elif 0.05 < dif_gap <= 0.1:
+        score += 2.5; reasons.append(f"DIF金叉稳定+2.5")
+    elif dif_gap < 0 and dif_gap >= -0.05:
+        score += 2; reasons.append(f"DIF即将金叉+2")
+    elif dif_gap > 0:
+        score += 1.5; reasons.append(f"金叉持续+1.5")
+    # else: dif_gap < -0.05, 距离较远，不给分
+    
+    # 2. MA20位置 (0-1.5分)
+    pct = (cur['close'] - cur['MA20']) / cur['MA20'] * 100
+    if pct < -0.5:
+        score += 1.5; reasons.append(f"MA20下方+1.5")
+    elif pct < 0:
+        score += 1; reasons.append(f"MA20附近+1")
+    elif pct < 1:
+        score += 0.5; reasons.append(f"MA20上方+0.5")
+    
+    # 3. 缩量 (0-2分)
+    vol_ratio = cur['volume'] / cur['VOL_MA20'] if cur['VOL_MA20'] > 0 else 99
+    if vol_ratio < 0.6:
+        score += 2; reasons.append(f"极度缩量+2")
+    elif vol_ratio < 0.8:
+        score += 1.5; reasons.append(f"明显缩量+1.5")
+    elif vol_ratio < 1.0:
+        score += 1; reasons.append(f"略微缩量+1")
+    
+    # 4. MA20斜率 (0-1分)
+    ma20_trend = (cur['MA20'] - df.iloc[i-5]['MA20']) / df.iloc[i-5]['MA20'] * 100
+    if ma20_trend > 0.5:
+        score += 1; reasons.append(f"MA20上行+1")
+    elif ma20_trend > 0:
+        score += 0.5; reasons.append(f"MA20走平+0.5")
+    
+    # 5. 均线收敛 (0-1.5分)
+    ma5_ma20_gap = abs(cur['MA5'] - cur['MA20']) / cur['MA20'] * 100
+    if ma5_ma20_gap < 2:
+        score += 1.5; reasons.append(f"均线收敛+1.5")
+    elif ma5_ma20_gap < 3:
+        score += 1; reasons.append(f"均线接近+1")
+    
+    # 6. 近期企稳 (0-1分)
+    up_count = sum(1 for j in range(i-2, i+1) if df.iloc[j]['close'] > df.iloc[j-1]['close'])
+    if up_count >= 2:
+        score += 1; reasons.append(f"近期企稳+1")
+    elif up_count >= 1:
+        score += 0.5; reasons.append(f"近期震荡+0.5")
+    
+    return round(score, 1), ' / '.join(reasons)
+
+def detect_signals(df):
+    """检测MA20+MACD信号"""
+    if len(df) < 30:
+        return []
+    
+    df = calc_indicators(df)
+    signals = []
+    
+    for i in range(25, len(df)-2):  # 留3天给买入+验证
+        cur = df.iloc[i]
+        prev = df.iloc[i-1]
+        
+        # 基础条件：MA20附近
+        pct = (cur['close'] - cur['MA20']) / cur['MA20']
+        if abs(pct) > 0.02:
+            continue
+        
+        # MA20不向下
+        ma20_trend = (cur['MA20'] - df.iloc[i-5]['MA20']) / df.iloc[i-5]['MA20']
+        if ma20_trend < -0.005:
+            continue
+        
+        # MACD准备金叉
+        dif_gap = cur['DIF'] - cur['DEA']
+        gap_narrowing = dif_gap > (prev['DIF'] - prev['DEA'])
+        close_to_golden = abs(dif_gap) < 0.3
+        macd_shortening = (prev['MACD'] < 0 and cur['MACD'] > prev['MACD']) or \
+                          (prev['MACD'] >= 0 and cur['MACD'] >= prev['MACD'])
+        if not (gap_narrowing and (close_to_golden or macd_shortening)):
+            continue
+        
+        # 安全过滤
+        if cur['volume'] > cur['VOL_MA20'] * 3 and cur['VOL_MA20'] > 0:
+            continue
+        if cur['close'] < 2:
+            continue
+        if cur['ATR'] / cur['close'] > 0.06:
+            continue
+        
+        # 打分
+        qscore, reasons = score_signal(df, i)
+        
+        signals.append({
+            'signal_date': df.index[i].strftime('%Y-%m-%d'),
+            'close': round(cur['close'], 2),
+            'ma20': round(cur['MA20'], 2),
+            'pct_to_ma20': round(pct * 100, 2),
+            'dif_gap': round(dif_gap, 3),
+            'vol_ratio': round(cur['volume'] / cur['VOL_MA20'], 2),
+            'quality': qscore,
+            'reasons': reasons,
+        })
+    
+    return signals
+
 def main():
-    log("=" * 40)
+    log("=" * 50)
+    log("反量化博弈策略 — 每日扫描启动")
     log(f"SERVER_CHAN_KEY={'已设置' if WECHAT_KEY else '未设置'}")
+    log("=" * 50)
     
-    # 一启动就发测试消息
     if WECHAT_KEY:
-        log("发送启动测试消息...")
-        ok = send_wechat("三阴不破阳 - 扫描启动", f"时间: {datetime.now().strftime('%H:%M')}\n脚本已启动!")
-        log(f"测试消息: {'成功' if ok else '失败'}")
-    else:
-        log("警告: 没有 SERVER_CHAN_KEY，无法发送微信")
+        ok = send_wechat("反量化策略 - 扫描启动", f"时间: {datetime.now().strftime('%H:%M')}\n脚本已启动")
+        log(f"启动测试: {'成功' if ok else '失败'}")
     
+    # 安装依赖
     try:
         import akshare as ak
     except ImportError:
         os.system("pip install akshare -q")
         import akshare as ak
     
-    log("获取A股数据...")
+    log("获取A股列表...")
     stock_list = ak.stock_zh_a_spot_em()
-    tickers = stock_list['代码'].head(200).tolist()
+    log(f"获取到 {len(stock_list)} 只")
+    
+    # 下载最近90天数据（每批50只）
+    tickers = stock_list['代码'].tolist()
+    SCAN_COUNT = min(len(tickers), 300)  # 扫描300只
     
     end = datetime.now()
-    start = end - timedelta(days=45)
+    start = end - timedelta(days=90)
     start_s, end_s = start.strftime("%Y%m%d"), end.strftime("%Y%m%d")
     
+    log(f"下载 {SCAN_COUNT} 只股票数据 ({start_s}~{end_s})...")
+    
     all_data = []
-    for idx, code in enumerate(tickers):
+    for idx in range(SCAN_COUNT):
+        code = tickers[idx]
         if idx % 50 == 0:
-            log(f"下载: {idx}/{len(tickers)}...")
+            log(f"下载: {idx}/{SCAN_COUNT}...")
         try:
             df = ak.stock_zh_a_hist(symbol=code, period="daily", start_date=start_s, end_date=end_s, adjust="qfq")
-            if df is None or len(df) < 15:
+            if df is None or len(df) < 30:
                 continue
-            df = df.rename(columns={'日期': 'time', '开盘': 'open', '最高': 'high', '最低': 'low', '收盘': 'close', '成交量': 'volume'})
             name = stock_list[stock_list['代码'] == code]['名称'].values[0]
-            df['thsname_cn'] = name
-            df['thscode'] = f"{code}.SZ" if code.startswith(('0', '3')) else f"{code}.SH"
-            all_data.append(df[['time', 'open', 'high', 'low', 'close', 'volume', 'thsname_cn', 'thscode']])
+            df['代码'] = code
+            df['名称'] = name
+            all_data.append(df)
         except:
             continue
     
-    combined = pd.concat(all_data, ignore_index=True)
-    log(f"获取完成: {combined['thscode'].nunique()} 只")
+    if not all_data:
+        log("下载失败，无数据")
+        send_wechat("反量化策略 - 错误", "数据下载失败，请检查网络")
+        return
     
-    # 选股
-    log("运行选股算法...")
-    all_results = []
-    for ticker in combined['thscode'].unique():
-        stock_df = combined[combined['thscode'] == ticker][['time', 'open', 'high', 'low', 'close', 'volume', 'thsname_cn', 'thscode']]
-        stock_df = stock_df.sort_values('time').reset_index(drop=True)
-        if len(stock_df) < 7:
-            continue
-        stock_df['prev_close'] = stock_df['close'].shift(1)
-        stock_df['change_pct'] = (stock_df['close'] - stock_df['prev_close']) / stock_df['prev_close']
+    log(f"下载完成: {len(all_data)} 只, 开始分析...")
+    
+    # 分析每只股票
+    today_signals = []
+    today_str = datetime.now().strftime('%Y-%m-%d')
+    
+    for df in all_data:
+        code = df['代码'].iloc[0]
+        name = df['名称'].iloc[0]
         
-        for i in range(1, len(stock_df) - 3):
-            if stock_df.loc[i, 'change_pct'] < 0.095:
-                continue
-            yang_low = stock_df.loc[i, 'low']
-            yang_date = stock_df.loc[i, 'time']
-            for dur in range(3, 6):
-                if i + dur >= len(stock_df):
-                    continue
-                valid = True
-                for j in range(1, dur + 1):
-                    idx = i + j
-                    if idx >= len(stock_df) or stock_df.loc[idx, 'close'] >= stock_df.loc[idx, 'open']:
-                        valid = False
-                        break
-                if not valid:
-                    continue
-                
-                sig_idx = i + dur + 1
-                name = str(stock_df['thsname_cn'].iloc[0])
-                ticker_code = str(stock_df['thscode'].iloc[0])
-                if sig_idx < len(stock_df):
-                    sig = stock_df.loc[sig_idx]
-                    if sig['close'] > sig['open']:
-                        all_results.append({"ticker": ticker_code, "name": name, "type": "complete", "yang_day": str(yang_date), "signal_day": str(sig['time']), "support_price": round(float(yang_low), 2)})
-                    else:
-                        all_results.append({"ticker": ticker_code, "name": name, "type": "potential", "yang_day": str(yang_date), "support_price": round(float(yang_low), 2)})
-                else:
-                    all_results.append({"ticker": ticker_code, "name": name, "type": "potential", "yang_day": str(yang_date), "support_price": round(float(yang_low), 2)})
+        df_p = df.rename(columns={'日期': 'time', '开盘': 'open', '最高': 'high', '最低': 'low', '收盘': 'close', '成交量': 'volume'})
+        df_p['time'] = pd.to_datetime(df_p['time'])
+        df_p = df_p.sort_values('time').set_index('time')
+        
+        signals = detect_signals(df_p)
+        
+        # 只看今天的信号
+        for s in signals:
+            if s['signal_date'] == today_str:
+                s['code'] = code
+                s['name'] = name
+                today_signals.append(s)
     
-    complete = [r for r in all_results if r["type"] == "complete"]
-    potential = [r for r in all_results if r["type"] == "potential"]
-    log(f"结果: {len(complete)} 完整, {len(potential)} 潜在")
+    log(f"今日信号: {len(today_signals)} 个")
     
-    # 保存
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    with open(OUTPUT_DIR / "scan_results.json", "w") as f:
-        json.dump(all_results, f, ensure_ascii=False)
+    # 按质量分排序
+    today_signals.sort(key=lambda x: x['quality'], reverse=True)
     
-    # 发最终结果
-    lines = [f"扫描 **{combined['thscode'].nunique()}** 只A股\n完整: **{len(complete)}** | 潜在: **{len(potential)}**\n"]
-    if complete:
-        lines.append("### 完整形态\n")
-        for c in complete:
-            lines.append(f"**{c['name']}** ({c['ticker']})\n涨停: {c['yang_day']} | 信号: {c['signal_day']}\n")
-    if not complete:
-        lines.append("本次未发现完整形态。\n")
-    lines.append("\n---\n*免责声明：本模型仅供学习研究，不构成投资建议*")
+    # 准备推送内容
+    output_signals = today_signals[:5]  # Top 5
     
-    send_wechat(f"三阴不破阳 - {datetime.now().strftime('%m-%d %H:%M')} 结果", "\n".join(lines))
+    lines = [
+        f"📊 **反量化博弈策略**",
+        f"扫描 {SCAN_COUNT} 只A股",
+        f"今日发现 **{len(today_signals)}** 个信号",
+        f"",
+    ]
+    
+    if output_signals:
+        lines.append(f"🔥 **TOP {len(output_signals)} 精选信号**")
+        lines.append(f"---")
+        
+        for i, s in enumerate(output_signals):
+            medals = ['🥇', '🥈', '🥉', '4️⃣', '5️⃣']
+            medal = medals[i] if i < 5 else '  '
+            q = s['quality']
+            star = '⭐' * int(q / 2.5) + f" ({q}/10)"
+            
+            lines.append(f"{medal} **{s['name']}** ({s['code']})")
+            lines.append(f"  质量: {star}")
+            lines.append(f"  收盘: {s['close']} | MA20: {s['ma20']} | 偏离: {s['pct_to_ma20']:+.2f}%")
+            lines.append(f"  DIF-DEA: {s['dif_gap']:+.3f} | 量比: {s['vol_ratio']:.2f}")
+            lines.append(f"  要点: {s['reasons']}")
+            lines.append(f"  操作: 明天开盘买入 | 持有5天 | 止损-5%")
+            lines.append(f"---")
+        
+        lines.append(f"💡 **使用指南**")
+        lines.append(f"1. 同仓位不超过2-3只")
+        lines.append(f"2. 每只持有5天，到期不管盈亏卖出")
+        lines.append(f"3. 触-5%止损提前卖出")
+        lines.append(f"4. 每天新信号替换到期信号")
+        
+        # 保存信号
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+        with open(OUTPUT_DIR / "anti_quant_signals.json", "w", encoding="utf-8") as f:
+            json.dump(output_signals, f, ensure_ascii=False, indent=2)
+        
+        # 发送微信
+        title = f"反量化策略 {today_str} — {len(today_signals)}个信号"
+        content = "\n".join(lines)
+        send_wechat(title, content)
+    else:
+        lines.append("❌ 今日无信号。可能原因：")
+        lines.append("- 市场处于极端行情")
+        lines.append("- 信号条件过严")
+        lines.append("- 数据不足")
+        send_wechat(f"反量化策略 {today_str} — 无信号", "\n".join(lines))
+    
     log("扫描完成!")
 
 if __name__ == "__main__":
